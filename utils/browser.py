@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
 
 from utils.debug import debug_print, is_debug_enabled
 from utils.popups import dismiss_popups, setup_popup_guard
@@ -24,6 +25,7 @@ EMAIL_LOGIN_BUTTON_NAMES = (
 	re.compile(r'Email or Username', re.I),
 	re.compile(r'Sign in with Email', re.I),
 	re.compile(r'Sign in with Email or Username', re.I),
+	re.compile(r'用户名.*密码|账号.*密码|邮箱.*继续|用户名或邮箱'),
 )
 EMAIL_LOGIN_ENTRY_SELECTORS = (
 	'.semi-card button:has(.semi-icon-mail):not(form.semi-form button)',
@@ -143,6 +145,8 @@ _OPEN_EMAIL_FORM_JS = """() => {
 class BrowserLoginResult:
 	cookies: dict[str, str]
 	api_user: str | None = None
+	user_info_before: dict | None = None
+	checked_in: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -378,19 +382,9 @@ def _extract_user_profile(payload: object) -> dict | None:
 	data = payload.get('data')
 	if payload.get('success') is True and isinstance(data, dict) and data.get('id'):
 		return data
-	if payload.get('id'):
+	if 'success' not in payload and payload.get('id'):
 		return payload
 	return None
-
-
-async def _parse_user_self_response(response) -> dict | None:
-	if USER_SELF_API_SUFFIX not in response.url or response.status != 200:
-		return None
-	try:
-		payload = await response.json()
-	except Exception:  # nosec B110
-		return None
-	return _extract_user_profile(payload)
 
 
 async def is_logged_in(page: Page) -> bool:
@@ -409,67 +403,46 @@ async def is_logged_in(page: Page) -> bool:
 	return False
 
 
-async def wait_for_session_cookie(page: Page, timeout_ms: int = SESSION_WAIT_TIMEOUT_MS) -> bool:
-	deadline = time.monotonic() + timeout_ms / 1000
-	while time.monotonic() < deadline:
-		if await has_session_cookie(page):
-			return True
-		await asyncio.sleep(0.5)
-	return False
-
-
-async def wait_for_logged_in(page: Page, timeout_ms: int = SESSION_WAIT_TIMEOUT_MS) -> bool:
-	deadline = time.monotonic() + timeout_ms / 1000
-	while time.monotonic() < deadline:
-		if await is_logged_in(page):
-			return True
-		await asyncio.sleep(0.5)
-	return False
-
-
-async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) -> dict | None:
-	"""跳转 /console 并拦截 /api/user/self，用浏览器会话确认登录用户。"""
+async def verify_browser_login(
+	page: Page,
+	console_url: str,
+	timeout_ms: int,
+	*,
+	api_user: str | None = None,
+	api_user_key: str = 'new-api-user',
+	user_info_path: str = USER_SELF_API_SUFFIX,
+) -> dict | None:
+	"""显式请求用户信息，控制台使用缓存时也能核验同一浏览器会话。"""
 	verify_timeout = min(timeout_ms, SESSION_WAIT_TIMEOUT_MS)
-	captured_profile: dict | None = None
-	verified = asyncio.Event()
-
-	async def on_response(response) -> None:
-		nonlocal captured_profile
-		if captured_profile is not None:
-			return
-		profile = await _parse_user_self_response(response)
-		if profile:
-			captured_profile = profile
-			verified.set()
-
-	page.on('response', on_response)
-	try:
-		print(f'[INFO] Verifying login via {console_url} and {USER_SELF_API_SUFFIX}')
-		await page.goto(console_url, wait_until='load', timeout=min(timeout_ms, 60_000))
-		try:
-			await page.wait_for_load_state('networkidle', timeout=20_000)
-		except Exception:  # nosec B110
-			pass
-
-		if captured_profile is None:
-			try:
-				await asyncio.wait_for(verified.wait(), timeout=verify_timeout / 1000)
-			except TimeoutError:
-				pass
-	finally:
-		page.remove_listener('response', on_response)
-
-	if captured_profile:
+	print(f'[INFO] Verifying login via {console_url} and {user_info_path}')
+	await page.goto(console_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
+	payload = await page.evaluate(
+		"""async ({ apiUser, apiUserKey, userInfoPath, timeout }) => {
+			const userId = apiUser || JSON.parse(localStorage.getItem('user') || 'null')?.id;
+			const headers = {};
+			if (userId) headers[apiUserKey] = String(userId);
+			const response = await fetch(userInfoPath, {
+				headers, credentials: 'include', signal: AbortSignal.timeout(timeout)
+			});
+			if (!response.ok) throw new Error(`User info verification failed: HTTP ${response.status}`);
+			return response.json();
+		}""",
+		{'apiUser': api_user, 'apiUserKey': api_user_key, 'userInfoPath': user_info_path, 'timeout': verify_timeout},
+	)
+	profile = _extract_user_profile(payload)
+	if profile and api_user and str(profile['id']) != str(api_user):
+		raise RuntimeError('Login verification returned a different user')
+	if profile:
 		if is_debug_enabled():
-			user_id = captured_profile.get('id')
-			username = captured_profile.get('username', '')
-			print(f'[INFO] Login verified via {USER_SELF_API_SUFFIX}: id={user_id}, username={username}')
+			user_id = profile.get('id')
+			username = profile.get('username', '')
+			print(f'[INFO] Login verified via {user_info_path}: id={user_id}, username={username}')
 		else:
 			print('[INFO] Login verified')
-		return captured_profile
+		return profile
 
 	if CONSOLE_PATH in page.url.lower():
-		print(f'[WARN] Reached {CONSOLE_PATH} but {USER_SELF_API_SUFFIX} returned no user profile')
+		print(f'[WARN] Reached {CONSOLE_PATH} but {user_info_path} returned no user profile')
 	else:
 		debug_print(f'[WARN] Login verification failed: current URL={page.url}')
 		print('[WARN] Login verification failed')
@@ -756,8 +729,6 @@ async def submit_login_form(page: Page, timeout_ms: int) -> None:
 	except Exception:
 		await submit.click(force=True, timeout=action_timeout)
 	await _wait_for_optional_load_state(page, 'domcontentloaded', action_timeout)
-	await _wait_for_optional_load_state(page, 'networkidle', min(timeout_ms, 30_000))
-	await wait_for_logged_in(page, SESSION_WAIT_TIMEOUT_MS)
 
 
 async def login_with_email_form(
@@ -768,7 +739,8 @@ async def login_with_email_form(
 	*,
 	provider: str = '',
 	account_name: str = '',
-) -> None:
+) -> dict:
+	"""以服务端登录响应确认鉴权，避免只等待 URL 导致失败原因被掩盖。"""
 	await _open_email_login_form(
 		page,
 		timeout_ms,
@@ -776,4 +748,19 @@ async def login_with_email_form(
 		account_name=account_name,
 	)
 	await fill_email_credentials(page, email, password, timeout_ms)
-	await submit_login_form(page, timeout_ms)
+	async with page.expect_response(
+		lambda response: urlsplit(response.url).path == '/api/user/login' and response.request.method == 'POST',
+		timeout=timeout_ms,
+	) as pending_response:
+		await submit_login_form(page, timeout_ms)
+	response = await pending_response.value
+	if response.status != 200:
+		raise RuntimeError(f'Password login failed: HTTP {response.status}')
+	payload = await response.json()
+	if not isinstance(payload, dict) or payload.get('success') is not True:
+		message = payload.get('message', 'Invalid login response') if isinstance(payload, dict) else 'Invalid login response'
+		raise RuntimeError(f'Password login failed: {message}')
+	profile = _extract_user_profile(payload)
+	if not profile:
+		raise RuntimeError('Password login returned no user profile; additional verification may be required')
+	return profile

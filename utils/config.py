@@ -98,7 +98,7 @@ class AppConfig:
 				name='agentrouter',
 				domain='https://agentrouter.org',
 				login_path='/login',
-				sign_in_path=None,  # 无需签到接口，查询用户信息时自动完成签到
+				sign_in_path=None,  # 奖励由真实登录发放，查询用户信息不会触发签到
 				user_info_path='/api/user/self',
 				api_user_key='new-api-user',
 				bypass_method='waf_cookies',
@@ -155,25 +155,35 @@ class AccountConfig:
 	name: str | None = None
 	email: str | None = None
 	password: str | None = None
+	github_session: str | None = None
+	linuxdo_session: str | None = None
 
 	@classmethod
 	def from_dict(cls, data: dict, index: int) -> 'AccountConfig':
 		"""从字典创建 AccountConfig"""
 		provider = data.get('provider', 'anyrouter')
 		name = data.get('name', f'Account {index + 1}')
+		cookies = data.get('cookies')
+		oauth_cookies = cookies if isinstance(cookies, dict) else {}
 
 		return cls(
-			cookies=data.get('cookies'),
+			cookies=cookies,
 			api_user=data.get('api_user'),
 			provider=provider,
 			name=name if name else None,
 			email=data.get('email'),
 			password=data.get('password'),
+			github_session=data.get('github_session') or oauth_cookies.get('user_session'),
+			linuxdo_session=data.get('linuxdo_session') or oauth_cookies.get('_forum_session'),
 		)
 
 	def has_login_credentials(self) -> bool:
-		"""是否配置了邮箱密码登录"""
+		"""email 保存登录名，可填写用户名或邮箱。"""
 		return bool(self.email and self.password)
+
+	def has_oauth_session(self) -> bool:
+		"""AgentRouter 可使用第三方会话完成真实重登录。"""
+		return self.provider == 'agentrouter' and bool(self.github_session or self.linuxdo_session)
 
 	def get_display_name(self, index: int) -> str:
 		"""获取显示名称"""
@@ -205,26 +215,22 @@ def load_accounts_config() -> list[AccountConfig] | None:
 				print(f'ERROR: Account {i + 1} configuration format is incorrect')
 				return None
 
-			if 'api_user' not in account_dict:
-				has_login = account_dict.get('email') and account_dict.get('password')
-				if not has_login:
-					print(
-						f'ERROR: Account {i + 1} missing required field (api_user) - only email+password login can omit it'
-					)
-					return None
+			account = AccountConfig.from_dict(account_dict, i)
+			has_login = account.has_login_credentials()
+			has_oauth = account.has_oauth_session()
+			if not account.api_user and not has_login and not has_oauth:
+				print(f'ERROR: Account {i + 1} missing api_user - only password or OAuth login can omit it')
+				return None
 
-			has_cookies = 'cookies' in account_dict and account_dict['cookies']
-			has_login = account_dict.get('email') and account_dict.get('password')
-
-			if not has_cookies and not has_login:
-				print(f'ERROR: Account {i + 1} must have either cookies or email+password')
+			if not account.cookies and not has_login and not has_oauth:
+				print(f'ERROR: Account {i + 1} must have cookies, email+password, or an OAuth session')
 				return None
 
 			if 'name' in account_dict and not account_dict['name']:
 				print(f'ERROR: Account {i + 1} name field cannot be empty')
 				return None
 
-			accounts.append(AccountConfig.from_dict(account_dict, i))
+			accounts.append(account)
 
 		return accounts
 	except Exception as e:

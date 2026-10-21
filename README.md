@@ -80,11 +80,41 @@
 
 **字段说明**：
 
-- `email` + `password`：推荐的浏览器登录方式，登录成功后会自动获取 cookies 与用户标识
+- `email` + `password`：浏览器登录方式，`email` 字段保存登录名，可填写用户名或邮箱；登录成功后自动获取 cookies 与用户标识
+- `github_session` / `linuxdo_session`：AgentRouter 的可选 OAuth 重登录方式，分别填写 GitHub 的 `user_session` 或 LinuxDo Connect 的 `_forum_session`；密码登录优先
 - `cookies`：兼容旧版的 session cookies 登录方式
-- `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；邮箱密码登录可省略
+- `api_user`：session cookies 登录时用于请求头的 new-api-user 参数；密码或 OAuth 登录可省略
 - `provider` (可选)：指定使用的服务商，默认为 `anyrouter`
 - `name` (可选)：自定义账号显示名称，用于通知和日志中标识账号
+
+AgentRouter 的奖励由真实登录触发，查询余额不会完成签到。只配置 AgentRouter 的静态 session cookies 会报告未触发重登录；请使用用户名/邮箱密码或 OAuth 会话。
+
+```json
+[
+  {
+    "name": "AG-R-1",
+    "provider": "agentrouter",
+    "email": "your_username_or_email",
+    "password": "your_password"
+  },
+  {
+    "name": "AG-R-2",
+    "provider": "agentrouter",
+    "github_session": "your_github_user_session"
+  }
+]
+```
+
+OAuth 授权使用浏览器获取 code，再由保存 state 的站点会话完成回调，支持首次授权确认。第三方会话过期或需要额外验证时会报告失败，不会回退为虚假签到成功。该流程参考 [suainam/anyrouter-autolog](https://github.com/suainam/anyrouter-autolog/commit/b6a1a880fa28592e7327a30d3828d4caee1d8fb8)，并保留后续 state、WAF cookies 与代理认证修复。
+
+所有账号处理结束后，日志与通知统一显示一张表格：
+
+| 账号 | 签到前余额 | 签到前消耗 | 签到后余额 | 签到后消耗 | 状态 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| AN-R-1 | $74.74 | $3150.26 | $99.74 | $3150.26 | 签到成功 |
+| AN-R-2 | $316.79 | $258.21 | $316.79 | $258.21 | 今日已签到 |
+
+AgentRouter 的签到前余额需要有效旧会话才能查询；未提供或已过期时显示 `—`，不会把登录后余额伪装成签到前余额。签到状态以登录响应 `checked_in` 为准，字段缺失时报告无法确认。通知仍仅在失败、首次运行或余额/消耗变化时发送。
 
 **默认值说明**：
 
@@ -172,10 +202,8 @@
   {
     "name": "AgentRouter 备用",
     "provider": "agentrouter",
-    "cookies": {
-      "session": "xyz789session"
-    },
-    "api_user": "user456"
+    "email": "account2@example.com",
+    "password": "account2_password"
   }
 ]
 ```
@@ -262,7 +290,7 @@
   - `sign_in_path: "/api/user/sign_in"`
 - `agentrouter`：
   - `bypass_method: "waf_cookies"`（需要获取 `acw_tc`）
-  - `sign_in_path: null`（查询用户信息时自动签到）
+  - `sign_in_path: null`（用户名/邮箱密码或 OAuth 真实重登录触发奖励）
   - `use_proxy: true`
 
 **重要提示**：
